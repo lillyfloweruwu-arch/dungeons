@@ -6,7 +6,7 @@
 <title>Dungeon Legends</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700;900&family=Spectral:ital,wght@0,400;0,600;0,700;1,500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700;900&family=Spectral:ital,wght@0,400;0,600;0,700;1,500&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 <style>
   :root{
     /* ===== Rich immersive fantasy palette (torch-lit dungeon) ===== */
@@ -3037,8 +3037,7 @@ function bootGame(){
 <!-- Supabase client: served from our own (school-whitelisted) domain so a content
      filter that blocks public CDNs can't break sign-in. Falls back to the CDN
      only if the local copy is somehow missing. -->
-<script src="vendor/supabase.min.js"></script>
-<script>window.supabase||document.write('<scr'+'ipt src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"><\/scr'+'ipt>');</script>
+
 <script>
 (function(){
   // Race a promise against a timer so a blocked/black-holed network request
@@ -3055,6 +3054,22 @@ function bootGame(){
   const SUPA_ANON = "sb_publishable_SMwdealRgVx0n1jGf_1yyw_6ZpjMfuq";
   const CONFIGURED = SUPA_URL.indexOf("YOUR_PROJECT_REF")===-1 && SUPA_ANON.indexOf("YOUR_SUPABASE_ANON_KEY")===-1;
 
+  let sdkPromise;
+  function loadSDK(){
+    if(window.supabase) return Promise.resolve(window.supabase);
+    if(sdkPromise) return sdkPromise;
+    const addScript=src=>withTimeout(new Promise((resolve,reject)=>{
+      const script=document.createElement('script'); script.async=true; script.src=src;
+      script.onload=()=>window.supabase?resolve(window.supabase):reject(new Error('SDK missing'));
+      script.onerror=()=>reject(new Error('SDK blocked'));
+      document.head.appendChild(script);
+    }),4000,'SDK');
+    sdkPromise=addScript('vendor/supabase.min.js')
+      .catch(()=>addScript('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'))
+      .catch(e=>{ sdkPromise=null; throw e; });
+    return sdkPromise;
+  }
+
   const Online = {
     sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _saveGen:0, _needsReload:false, _reloading:null, _bootGen:0, _cloudLoaded:false, _dirty:0, _saved:0, _dirtySince:0, _saving:false,
     _retryAt:0, _retryDelay:4000, _status:'Saved', _scoreTarget:0, _scoreTimer:null, _scoring:false, _scoreFailed:false,
@@ -3069,8 +3084,12 @@ function bootGame(){
       showGate(true);
       if(!CONFIGURED){ setGateNote("Online isn't configured yet — Play Offline works."); return; }
       try{
-        this.sb = window.supabase.createClient(SUPA_URL, SUPA_ANON);
+        const sdk=await loadSDK();
+        if(gen!==this._bootGen) return;
+        this.sb = sdk.createClient(SUPA_URL, SUPA_ANON);
       }catch(e){
+        if(gen!==this._bootGen) return;
+        ++this._bootGen;
         console.warn("Supabase init failed", e);
         setGateNote("Online features are blocked on this network — Play Offline still works.");
         return;
@@ -3096,7 +3115,11 @@ function bootGame(){
     },
 
     async signIn(){
-      if(!this.sb){ setGateNote("Online isn't set up yet."); return; }
+      const gen=this._bootGen;
+      if(!this.sb){
+        try{ const sdk=await loadSDK(); if(gen!==this._bootGen) return; this.sb=sdk.createClient(SUPA_URL,SUPA_ANON); }
+        catch(e){ if(gen===this._bootGen) setGateNote('Online is unavailable. Play Offline still works.'); return; }
+      }
       setGateNote("Redirecting to Google…");
       const redirectTo = location.origin + location.pathname;
       try{
@@ -3417,8 +3440,7 @@ function bootGame(){
 
 
   // Kick things off once the DOM + game script are ready.
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', ()=>Online.init());
-  else Online.init();
+  Online.init();
 })();
 </script>
 </body>
