@@ -735,7 +735,7 @@ function ensureDeckLibrary(legacyDeck){
   }
   S.decks = S.decks
     .filter(d=>d && Array.isArray(d.cards))
-    .map(d=>({ id:d.id||newDeckId(), name:String(d.name||"Deck").slice(0,60), cards:d.cards.filter(validQ) }))
+    .map(d=>({ id:typeof d.id==='string' && /^[a-zA-Z0-9_-]+$/.test(d.id)?d.id:newDeckId(), name:String(d.name||"Deck").slice(0,60), cards:d.cards.filter(validQ) }))
     .filter(d=>d.cards.length);
   if(!S.decks.length) S.decks = [{ id:newDeckId(), name:"Default Deck", cards:DEFAULT_DECK.slice() }];
   if(!S.activeDeckId || !S.decks.some(d=>d.id===S.activeDeckId)) S.activeDeckId = S.decks[0].id;
@@ -758,7 +758,7 @@ function renameDeckPrompt(id){
 function deleteDeckConfirm(id){
   const d = S.decks.find(x=>x.id===id); if(!d) return;
   if(S.decks.length<=1){ toast("Can't delete your only deck."); return; }
-  msg("Delete deck?", `Delete <b>${escapeHtml(d.name)}</b> (${d.cards.length} questions)? This can't be undone.`,
+  msg("Delete deck?", `Delete <b>${esc(d.name)}</b> (${d.cards.length} questions)? This can't be undone.`,
     [{t:"Cancel", cls:"ghost", fn:closeMsg},
      {t:"Delete", cls:"red", fn:()=>{
         const wasActive = (S.activeDeckId===id);
@@ -1075,12 +1075,12 @@ function backToHub(){ showScreen('hub'); renderHub(); }
 function renderHub(){
   const d = derived();
   document.getElementById('hubStats').innerHTML = `
-    <div class="statrow">HP <b>${d.maxHp}</b></div>
-    <div class="statrow">MP <b>${d.maxMp}</b></div>
-    <div class="statrow">Attack <b>${d.atk}</b></div>
-    <div class="statrow">Defense <b>${d.def}</b></div>
-    <div class="statrow">Crit <b>${d.crit}%</b></div>
-    <div class="statrow">Gold <b>${S.gold}</b></div>`;
+    <div class="statrow">HP <b>${esc(d.maxHp)}</b></div>
+    <div class="statrow">MP <b>${esc(d.maxMp)}</b></div>
+    <div class="statrow">Attack <b>${esc(d.atk)}</b></div>
+    <div class="statrow">Defense <b>${esc(d.def)}</b></div>
+    <div class="statrow">Crit <b>${esc(d.crit)}%</b></div>
+    <div class="statrow">Gold <b>${esc(S.gold)}</b></div>`;
   document.getElementById('hubBestFloor').textContent = S.bestFloor;
   document.getElementById('hubDeckCount').textContent = deck.length;
   document.getElementById('goldPill') && (document.getElementById('goldPill').textContent = "💰 "+S.gold);
@@ -1122,11 +1122,11 @@ function renderTalents(){
       const canBuy = !maxed && !locked && S.skillPoints>0;
       const cls = (n.keystone?"keystone ":"") + (maxed? "maxed" : (locked? "locked" : ""));
       const onclick = canBuy ? `onclick="buyTalent('${n.key}')"` : "";
-      const lockNote = (n.keystone && locked) ? ` <span class="ks-req">🔒 ${spent}/${KEYSTONE_REQ} pts in branch</span>` : "";
+      const lockNote = (n.keystone && locked) ? ` <span class="ks-req">🔒 ${esc(spent)}/${KEYSTONE_REQ} pts in branch</span>` : "";
       const rankTag = maxed? " ✓" : (locked? " 🔒" : (canBuy? " +" : ""));
       return `<div class="talent-node ${cls}" ${onclick}>
         <div class="tn-top"><span class="tn-name" style="color:var(${br.color})">${n.keystone?"★ ":""}${n.name}</span>
-          <span class="tn-rank">${rank}/${n.max}${rankTag}</span></div>
+          <span class="tn-rank">${esc(rank)}/${n.max}${rankTag}</span></div>
         <div class="tn-desc">${n.desc}${(!n.keystone && n.max>1)?` <span style="color:var(--muted)">(per rank)</span>`:''}${lockNote}</div>
       </div>`;
     }).join("");
@@ -1147,7 +1147,7 @@ function buyTalent(key){
 function respecTalents(){
   const spent = talentSpent();
   if(spent===0){ toast("No talents to refund"); return; }
-  msg("Respec Talents?", `Refund all <b>${spent}</b> spent points to reassign them? Free.`,
+  msg("Respec Talents?", `Refund all <b>${esc(spent)}</b> spent points to reassign them? Free.`,
     [{t:"Cancel", cls:"ghost", fn:closeMsg},
      {t:"Respec", cls:"gold", fn:()=>{
         S.skillPoints += spent; S.talents = {}; save(); closeMsg(); renderTalents();
@@ -1276,7 +1276,7 @@ const EVENTS = [
   { title:"🚪 Mysterious Door", desc:"A heavy door hums with faint magic.", choices:[
     {t:"Open it", fn:(floor)=>{ const r=Math.random();
       if(r<0.5){ const g=Math.round(30+floor*6); S.gold+=g; return `You find <b>💰 ${g} gold</b>!`; }
-      if(r<0.8){ const it=makeItem(rollRarity(floor,false), floor); S.inventory.push(it); return `Treasure! You found <b style="color:var(--${it.rarity})">${it.name}</b>.`; }
+      if(r<0.8){ const it=makeItem(rollRarity(floor,false), floor); S.inventory.push(it); return `Treasure! You found <b style="color:var(--${esc(it.rarity)})">${esc(it.name)}</b>.`; }
       const dmg=Math.round(run.hero.maxHp*0.15); run.hero.hp=Math.max(1,run.hero.hp-dmg); return `It's a trap! You lose <b style="color:var(--red)">${dmg} HP</b>.`; }},
     {t:"Leave it", fn:()=> "You leave the door untouched."} ]},
   { title:"🧎 Wounded Adventurer", desc:"A hurt adventurer asks you for 50 gold.", choices:[
@@ -1410,7 +1410,7 @@ function isSpell(a){ return a.type!=="phys" && a.type!=="focus"; }
 function renderActionBar(){
   const bar = document.getElementById('actionbar');
   const list = (S.loadout && S.loadout.length ? S.loadout : ["strike","slash","fireball","heal"]).filter(k=>ACTIONS[k]);
-  bar.innerHTML = list.map(k=>{
+  bar.innerHTML = list.filter(k=>ABILITY_ORDER.includes(k)).map(k=>{
     const a = ACTIONS[k];
     const costTxt = a.mpGain ? `0 · <span style="color:var(--green)">+${a.mpGain}</span>`
                   : (a.cost>0 ? a.cost+" MP" : "0 MP");
@@ -2029,11 +2029,11 @@ function grantLoot(rarity, stars){
                 : topRar>=4 ? `<div class="loot-banner" style="color:var(--legendary)">★ LEGENDARY! ★</div>` : "";
   let itemsHtml = banner + `<div style="margin-bottom:10px"><b class="pill gold">💰 +${gold} gold</b> <span style="color:var(--muted)">(${goldMult}× multiplier)</span></div>`;
   itemsHtml += drops.map(it=>`
-    <div class="item rar-${it.rarity} ${RARITY_ORDER[it.rarity]>=4?'loot-hi':''} ${it.rarity==='mythic'?'loot-myth':''}" style="cursor:default; margin-bottom:8px">
-      <span class="rtag" style="color:var(--${it.rarity})">${it.unique?'★ ':''}${it.rarity}</span>
-      <div class="iname">${SLOT_ICON[it.type]||''} ${it.name}</div>
-      <div class="itype">${it.type}</div>
-      <div class="istats">${statLine(it)}</div>
+    <div class="item rar-${esc(it.rarity)} ${RARITY_ORDER[it.rarity]>=4?'loot-hi':''} ${it.rarity==='mythic'?'loot-myth':''}" style="cursor:default; margin-bottom:8px">
+      <span class="rtag" style="color:var(--${esc(it.rarity)})">${it.unique?'★ ':''}${esc(it.rarity)}</span>
+      <div class="iname">${SLOT_ICON[it.type]||''} ${esc(it.name)}</div>
+      <div class="itype">${esc(it.type)}</div>
+      <div class="istats">${esc(statLine(it))}</div>
       ${affixHtml(it)}
     </div>`).join("");
 
@@ -2123,10 +2123,10 @@ function renderInventory(){
   slots.innerHTML = ITEM_TYPES.map(type=>{
     const it = S.equipped[type];
     if(it){
-      return `<div class="slot rar-${it.rarity}">
+      return `<div class="slot rar-${esc(it.rarity)}">
         <div class="lbl">${SLOT_ICON[type]||''} ${type}</div>
-        <div style="font-weight:800; font-size:12px; margin-top:2px; color:var(--${it.rarity})">${it.name}</div>
-        <div class="istats" style="color:var(--green); font-size:11px">${statLine(it)}</div>
+        <div style="font-weight:800; font-size:12px; margin-top:2px; color:var(--${esc(it.rarity)})">${esc(it.name)}</div>
+        <div class="istats" style="color:var(--green); font-size:11px">${esc(statLine(it))}</div>
         ${affixHtml(it)}
         <button class="btn ghost sm" style="margin-top:6px; font-size:11px; padding:4px 8px" onclick="unequip('${type}')">Unequip</button>
       </div>`;
@@ -2143,15 +2143,15 @@ function renderInventory(){
   const sorted = S.inventory.slice().sort((a,b)=> ((RARITY_ORDER[b.rarity]||0)-(RARITY_ORDER[a.rarity]||0)) || a.type.localeCompare(b.type));
   grid.innerHTML = sorted.map(it=>{
     const isEq = S.equipped[it.type] && S.equipped[it.type].id===it.id;
-    return `<div class="item rar-${it.rarity} ${it.rarity==='mythic'?'loot-myth':''} ${isEq?'equipped':''}" onclick="equipItem(${it.id})">
-      <span class="rtag" style="color:var(--${it.rarity})">${it.unique?'★ ':''}${it.rarity}</span>
-      <div class="iname">${SLOT_ICON[it.type]||''} ${it.name}</div>
-      <div class="itype">${it.type}</div>
-      <div class="istats">${statLine(it)}</div>
+    return `<div class="item rar-${esc(it.rarity)} ${it.rarity==='mythic'?'loot-myth':''} ${isEq?'equipped':''}" onclick="equipItem(${Number.isSafeInteger(it.id)?it.id:-1})">
+      <span class="rtag" style="color:var(--${esc(it.rarity)})">${it.unique?'★ ':''}${esc(it.rarity)}</span>
+      <div class="iname">${SLOT_ICON[it.type]||''} ${esc(it.name)}</div>
+      <div class="itype">${esc(it.type)}</div>
+      <div class="istats">${esc(statLine(it))}</div>
       ${affixHtml(it)}
       <div style="margin-top:8px; display:flex; gap:6px">
-        <button class="btn sm" style="flex:1; font-size:11px; padding:5px" onclick="event.stopPropagation(); equipItem(${it.id})">${isEq?'Equipped':'Equip'}</button>
-        <button class="btn ghost sm" style="font-size:11px; padding:5px 8px" onclick="event.stopPropagation(); sellItem(${it.id})">Sell</button>
+        <button class="btn sm" style="flex:1; font-size:11px; padding:5px" onclick="event.stopPropagation(); equipItem(${Number.isSafeInteger(it.id)?it.id:-1})">${isEq?'Equipped':'Equip'}</button>
+        <button class="btn ghost sm" style="font-size:11px; padding:5px 8px" onclick="event.stopPropagation(); sellItem(${Number.isSafeInteger(it.id)?it.id:-1})">Sell</button>
       </div>
     </div>`;
   }).join("");
@@ -2211,9 +2211,9 @@ function statLine(it){
 function affixHtml(it){
   let lines = "";
   if(it.affixes && it.affixes.length){
-    lines += it.affixes.map(a=>{ const d=AFFIX_MAP[a.key]; return d? `<span>✦ ${d.fmt(a.val)}</span>` : ""; }).filter(Boolean).join("");
+    lines += it.affixes.map(a=>{ const d=AFFIX_MAP[a.key]; return d? `<span>✦ ${esc(d.fmt(a.val))}</span>` : ""; }).filter(Boolean).join("");
   }
-  if(it.unique && it.sig) lines += `<span style="color:var(--gold); font-style:italic">“${it.sig}”</span>`;
+  if(it.unique && it.sig) lines += `<span style="color:var(--gold); font-style:italic">“${esc(it.sig)}”</span>`;
   return lines ? `<div class="iaffix">${lines}</div>` : "";
 }
 
@@ -2236,7 +2236,7 @@ function renderShop(){
     const can = S.gold>=cost;
     return `<div class="shoprow">
       <div class="info">
-        <b>${def.icon} ${def.name} <span style="color:var(--muted); font-weight:600">Lv.${lvl}</span></b>
+        <b>${def.icon} ${def.name} <span style="color:var(--muted); font-weight:600">Lv.${esc(lvl)}</span></b>
         <small>${def.desc} per level</small>
       </div>
       <button class="btn ${can?'gold':'ghost'} sm" ${can?'':'disabled'} onclick="buyUpgrade('${def.key}')">💰 ${cost}</button>
@@ -2324,7 +2324,7 @@ function doImport(){
   }
 
   const d = addDeck(name || defaultDeckName(), cards);
-  msgEl.innerHTML = `<span style='color:var(--green)'>✔ Created “${escapeHtml(d.name)}” with ${cards.length} question${cards.length!==1?'s':''}!${note}</span>`;
+  msgEl.innerHTML = `<span style='color:var(--green)'>✔ Created “${esc(d.name)}” with ${cards.length} question${cards.length!==1?'s':''}!${note}</span>`;
   toast("Deck created: "+d.name);
   setTimeout(()=>{ closeImport(); showScreen('decks'); renderDecks(); renderHub(); }, note ? 2000 : 900);
 }
@@ -2344,7 +2344,7 @@ function renderDecks(){
     const active = d.id===S.activeDeckId;
     return `<div class="deckrow${active?' active':''}">
       <div class="deckrow-main">
-        <div class="deckrow-name">${active?'<span class="deck-badge">ACTIVE</span> ':''}${escapeHtml(d.name)}</div>
+        <div class="deckrow-name">${active?'<span class="deck-badge">ACTIVE</span> ':''}${esc(d.name)}</div>
         <div class="deckrow-sub">${d.cards.length} question${d.cards.length!==1?'s':''}</div>
       </div>
       <div class="deckrow-btns">
@@ -2367,7 +2367,7 @@ function renderDeckView(){
   document.getElementById('deckSummary').innerHTML = `
     <div class="deck-summary">
       <div class="ds-tile"><div class="big">${deck.length}</div><div class="lbl">Questions</div></div>
-      <div class="ds-tile"><div class="big">${totalSeen}</div><div class="lbl">Answered</div></div>
+      <div class="ds-tile"><div class="big">${esc(totalSeen)}</div><div class="lbl">Answered</div></div>
       <div class="ds-tile"><div class="big" style="color:var(${totalSeen? (overall>=80?'--green':overall>=50?'--gold':'--red'):'--muted'})">${totalSeen? overall+'%':'—'}</div><div class="lbl">Deck Accuracy</div></div>
     </div>`;
   document.getElementById('deckList').innerHTML = deck.map((q,i)=>{
@@ -2377,11 +2377,11 @@ function renderDeckView(){
     const accBadge = seen
       ? `<span class="acc ${accClass(pct)}">${pct}%</span>`
       : `<span class="acc acc-none">not seen</span>`;
-    const opts = q.o.map((o,oi)=>`<div class="qopt ${oi===q.a?'right':''}">${oi===q.a?'✓ ':''}${escapeHtml(o)}</div>`).join("");
+    const opts = q.o.map((o,oi)=>`<div class="qopt ${oi===q.a?'right':''}">${oi===q.a?'✓ ':''}${esc(o)}</div>`).join("");
     return `<div class="qcard">
       <div class="qhead">
-        <div class="qq"><span class="qnum">${i+1}.</span>${escapeHtml(q.q)}</div>
-        <div class="qstat"><span style="color:var(--muted)">×${seen}</span>${accBadge}</div>
+        <div class="qq"><span class="qnum">${i+1}.</span>${esc(q.q)}</div>
+        <div class="qstat"><span style="color:var(--muted)">×${esc(seen)}</span>${accBadge}</div>
       </div>
       <div class="qopts">${opts}</div>
     </div>`;
@@ -2392,7 +2392,7 @@ function confirmResetStats(){
     [{t:"Cancel", cls:"ghost", fn:closeMsg},
      {t:"Reset Stats", cls:"red", fn:()=>{ S.qstats={}; save(); closeMsg(); renderDeckView(); toast("Deck stats reset."); }}]);
 }
-function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 /* UTF-8-safe base64 decode */
 function decodeB64Unicode(b64){
   const bin = atob(b64);
@@ -2534,7 +2534,7 @@ function importSaveFromText(){
     if(!obj || !obj.s || typeof obj.s !== "object" || Array.isArray(obj.s)) throw new Error("bad");
   }catch(e){ msgEl.innerHTML = "<span style='color:var(--red)'>That isn't a valid Dungeon Legends save code.</span>"; return; }
   const info = `Floor ${obj.s.bestFloor||1} · Level ${obj.s.level||1} · 💰 ${obj.s.gold||0}`;
-  msg("Load this save?", `This replaces your current progress on <b>this device</b> with the imported save:<br><b>${info}</b><br><small style="color:var(--muted)">Your current progress here will be overwritten.</small>`,
+  msg("Load this save?", `This replaces your current progress on <b>this device</b> with the imported save:<br><b>${esc(info)}</b><br><small style="color:var(--muted)">Your current progress here will be overwritten.</small>`,
     [{t:"Cancel", cls:"ghost", fn:closeMsg},
      {t:"Load Save", cls:"gold", fn:()=>{
         try{
@@ -3240,7 +3240,7 @@ function bootGame(){
     bar.style.display='flex';
     if(Online.mode==='online' && Online.profile){
       const banned = Online.isBanned() ? ' <span style="color:var(--red)">(banned)</span>' : '';
-      bar.innerHTML = '<span class="ab-user">👤 '+escapeHtml(Online.profile.username)+banned+'</span>'
+      bar.innerHTML = '<span class="ab-user">👤 '+esc(Online.profile.username)+banned+'</span>'
         + '<button class="btn ghost sm" onclick="Online.signOut()">Sign out</button>';
     } else {
       bar.innerHTML = '<span class="ab-user">👻 Playing offline</span>'
@@ -3258,7 +3258,7 @@ function bootGame(){
       const me = Online.profile && Online.profile.username;
       el.innerHTML = rows.map((r,i)=>{
         const mine = r.username===me ? ' style="color:var(--gold);font-weight:800"' : '';
-        return '<div class="statrow"'+mine+'><span>'+(i+1)+'. '+escapeHtml(r.username)+'</span><b>Floor '+r.best_floor+'</b></div>';
+        return '<div class="statrow"'+mine+'><span>'+(i+1)+'. '+esc(r.username)+'</span><b>Floor '+esc(r.best_floor)+'</b></div>';
       }).join('');
     }catch(e){ el.innerHTML='<div class="hint">Couldn\'t load the leaderboard.</div>'; }
   };
@@ -3267,13 +3267,13 @@ function bootGame(){
     const el=document.getElementById('adList'); el.innerHTML='Loading…';
     if(!Online.isAdmin()){ el.innerHTML='<div class="hint">Not authorized.</div>'; return; }
     try{
-      const rows = await Online.adminList();
+      const rows = (await Online.adminList()).filter(r=>typeof r.id==='string' && /^[0-9a-f-]{36}$/i.test(r.id));
       if(!rows.length){ el.innerHTML='<div class="hint">No players yet.</div>'; return; }
       el.innerHTML = rows.map(r=>{
         const b = r.banned;
         return '<div class="ad-row" style="border-bottom:1px solid var(--border);padding:8px 0">'
           + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">'
-          + '<b>'+escapeHtml(r.username)+'</b><span class="hint">Floor '+r.best_floor+(b?' · BANNED':'')+'</span></div>'
+          + '<b>'+esc(r.username)+'</b><span class="hint">Floor '+esc(r.best_floor)+(b?' · BANNED':'')+'</span></div>'
           + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">'
           + '<button class="btn ghost sm" onclick="adminAction(\''+r.id+'\',\''+(b?'unban':'ban')+'\')">'+(b?'Unban':'Ban')+'</button>'
           + '<button class="btn ghost sm" onclick="adminAction(\''+r.id+'\',\'wipe\')">Wipe items</button>'
@@ -3294,7 +3294,6 @@ function bootGame(){
     }catch(e){ if(window.toast) toast('Action failed.'); }
   };
 
-  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
   // Kick things off once the DOM + game script are ready.
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', ()=>Online.init());
