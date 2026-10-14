@@ -661,7 +661,19 @@
    DUNGEON LEGENDS  —  single-file offline HTML5 game
    ========================================================================== */
 
-const SAVE_KEY = "dungeon_legends_save_v2";   // v2 = hard reset for the online launch (old v1 saves are ignored)
+const GUEST_SAVE_KEY = "dungeon_legends_save_guest";
+let SAVE_KEY = GUEST_SAVE_KEY;
+// Preserve both legacy files; copy only into an absent guest cache.
+function migrateGuestSave(){
+  try{
+    if(localStorage.getItem(GUEST_SAVE_KEY)!==null) return;
+    const raw = localStorage.getItem("dungeon_legends_save_v2") || localStorage.getItem("dungeon_legends_save_v1");
+    if(raw) localStorage.setItem(GUEST_SAVE_KEY, raw);
+  }catch(e){}
+}
+function cachedSave(key){
+  try{ const p=JSON.parse(localStorage.getItem(key)); return p && p.s && typeof p.s==='object' && !Array.isArray(p.s) ? p : null; }catch(e){ return null; }
+}
 
 /* ---------- Default question deck (works out of the box) ---------- */
 const DEFAULT_DECK = [
@@ -956,6 +968,7 @@ function save(){
 // Merge a saved blob ({s, deck}) into the live game state. Shared by local load() and cloud load.
 function hydrateSave(p){
   S = Object.assign(freshState(), (p&&p.s)||{});
+  if(!Number.isSafeInteger(S.bestFloor) || S.bestFloor<1) S.bestFloor=1;
   S.base = Object.assign(freshState().base, S.base||{});
   S.upgrades = Object.assign(freshState().upgrades, S.upgrades||{});
   S.equipped = Object.assign({weapon:null,armor:null,helmet:null,boots:null,accessory:null,trinket:null}, S.equipped||{});
@@ -1203,7 +1216,7 @@ function openRoomChoice(floor){
   document.getElementById('roomSub').innerHTML = `${biomeFor(floor).icon} ${biomeLabel(floor)}${run.expert?' · <span style="color:var(--gold)">🔥 Expert</span>':''}`;
   document.getElementById('roomChoices').innerHTML = picks.map(t=>{
     const r=ROOMS[t];
-    return `<button class="room-card room-${t}" onclick="enterRoom('${t}',${floor})">
+    return `<button class="room-card room-${t}" onclick="enterRoom('${t}',${Number.isSafeInteger(floor)?floor:1})">
       <div class="room-ico">${r.icon}</div><div class="room-name">${r.name}</div><div class="room-desc">${r.desc}</div></button>`;
   }).join("");
   document.getElementById('roomOverlay').classList.add('active');
@@ -1764,7 +1777,7 @@ function enemyDefeated(){
 function heroDied(){
   battle.done = true;
   msg("💀 You Have Fallen",
-    `You reached <b>Floor ${battle.floor}</b>.<br>You keep all gold and equipped gear.<br>Return to the Hub to upgrade, then try again!`,
+    `You reached <b>Floor ${esc(battle.floor)}</b>.<br>You keep all gold and equipped gear.<br>Return to the Hub to upgrade, then try again!`,
     [{t:"Return to Hub", cls:"gold", fn:()=>{closeMsg(); backToHub();}}]);
   save();
 }
@@ -2518,15 +2531,14 @@ function importSaveFromText(){
     if(code.startsWith("DLS-")) code = code.slice(4).trim();
     const json = code.startsWith("{") ? code : decodeB64Unicode(code);
     obj = JSON.parse(json);
-    if(!obj || !obj.s || typeof obj.s !== "object") throw new Error("bad");
+    if(!obj || !obj.s || typeof obj.s !== "object" || Array.isArray(obj.s)) throw new Error("bad");
   }catch(e){ msgEl.innerHTML = "<span style='color:var(--red)'>That isn't a valid Dungeon Legends save code.</span>"; return; }
   const info = `Floor ${obj.s.bestFloor||1} · Level ${obj.s.level||1} · 💰 ${obj.s.gold||0}`;
   msg("Load this save?", `This replaces your current progress on <b>this device</b> with the imported save:<br><b>${info}</b><br><small style="color:var(--muted)">Your current progress here will be overwritten.</small>`,
     [{t:"Cancel", cls:"ghost", fn:closeMsg},
      {t:"Load Save", cls:"gold", fn:()=>{
         try{
-          localStorage.setItem(SAVE_KEY, JSON.stringify(obj));
-          load(); resetBag();
+          hydrateSave(obj); resetBag(); save();
         }catch(e){}
         closeMsg(); closeSaveMgr(); renderHub(); updateDeckInfo();
         toast("✔ Save loaded!");
@@ -3043,7 +3055,7 @@ function bootGame(){
   const CONFIGURED = SUPA_URL.indexOf("YOUR_PROJECT_REF")===-1 && SUPA_ANON.indexOf("YOUR_SUPABASE_ANON_KEY")===-1;
 
   const Online = {
-    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0,
+    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _cloudLoaded:false,
 
     async init(){
       injectUI();
@@ -3053,7 +3065,6 @@ function bootGame(){
       // never appeared and the whole page looked blank.)
       showGate(true);
       if(!CONFIGURED){ setGateNote("Online isn't configured yet — Play Offline works."); return; }
-      if(!window.supabase){ setGateNote("Online features are blocked on this network — Play Offline still works."); return; }
       try{
         this.sb = window.supabase.createClient(SUPA_URL, SUPA_ANON);
       }catch(e){
@@ -3081,19 +3092,22 @@ function bootGame(){
       if(!this.sb){ setGateNote("Online isn't set up yet."); return; }
       setGateNote("Redirecting to Google…");
       const redirectTo = location.origin + location.pathname;
-      const { error } = await this.sb.auth.signInWithOAuth({ provider:'google', options:{ redirectTo } });
-      if(error){ setGateNote("Sign-in failed: "+error.message); }
+      try{
+        const { error } = await withTimeout(this.sb.auth.signInWithOAuth({ provider:'google', options:{ redirectTo } }),10000,'signIn');
+        if(gen!==this._bootGen) return;
+        if(error) throw error;
+      }catch(e){ if(gen===this._bootGen) setGateNote('Sign-in failed: '+e.message); }
     },
 
     playOffline(){
-      this.mode = 'offline';
-      load();
-      try{ localStorage.removeItem("dungeon_legends_save_v1"); }catch(e){}
+      this.mode = 'offline'; this._cloudLoaded = false;
+      SAVE_KEY = GUEST_SAVE_KEY; migrateGuestSave(); load();
       showGate(false); renderAcctBar(); bootGame();
     },
 
     async enterOnline(session){
-      this.session = session; this.mode = 'online';
+      this.session = session; this.mode = 'loading'; this._cloudLoaded = false;
+      SAVE_KEY = 'dungeon_legends_save_user_' + session.user.id;
       const meta = session.user.user_metadata || {};
       const full = meta.full_name || meta.name || meta.email || "Player";
       const first = String(full).trim().split(/\s+/)[0] || "Player";
@@ -3102,27 +3116,39 @@ function bootGame(){
         if(error) throw error;
         this.profile = Array.isArray(data) ? data[0] : data;
       }catch(e){ console.warn("ensure_profile failed", e); }
-      await this.loadCloud();
-      try{ localStorage.removeItem("dungeon_legends_save_v1"); }catch(e){}
+      if(!await this.loadCloud()) return;
+      this.mode='online';
       showGate(false); renderAcctBar(); bootGame();
     },
 
     async loadCloud(){
+      this._cloudLoaded = false;
       try{
-        const { data } = await this.sb.from('saves').select('data').eq('user_id', this.session.user.id).maybeSingle();
-        if(data && data.data && data.data.s){ hydrateSave(data.data); }
-        else { S = freshState(); ensureDeckLibrary(); }
-      }catch(e){ console.warn("loadCloud failed", e); S = freshState(); ensureDeckLibrary(); }
-      try{ localStorage.setItem(SAVE_KEY, JSON.stringify({s:S, deck})); }catch(e){}
+        const { data, error } = await withTimeout(this.sb.from('saves').select('data').eq('user_id', this.session.user.id).maybeSingle(), 8000, 'loadCloud');
+        if(error) throw error;
+        // An absent row (or the empty placeholder created by ensure_profile) is confirmed fresh.
+        if(data && data.data && data.data.s && typeof data.data.s==='object' && !Array.isArray(data.data.s)){ hydrateSave(data.data); }
+        else if(!data || (data.data && Object.keys(data.data).length===0)){ S = freshState(); ensureDeckLibrary(); }
+        else throw new Error('Invalid cloud save');
+        this._cloudLoaded = true;
+        try{ localStorage.setItem(SAVE_KEY, JSON.stringify({s:S, deck})); }catch(e){}
+        return true;
+      }catch(e){
+        console.warn("loadCloud failed", e);
+        const cached = fallback ? cachedSave(SAVE_KEY) : null;
+        if(cached){ hydrateSave(cached); toast("Cloud unavailable — playing your cached save. Cloud writes are paused."); return true; }
+        setGateNote("Cloud unavailable and no account cache exists. Try again later or Play Offline.");
+        return false;
+      }
     },
 
     saveCloudDebounced(){ clearTimeout(this._saveTimer); this._saveTimer = setTimeout(()=>this.saveCloud(), 4000); },
     async saveCloud(){
-      if(this.mode!=='online' || !this.sb) return;
+      if(this.mode!=='online' || !this.sb || !this._cloudLoaded) return;
       try{ await this.sb.rpc('save_game', { p_data:{ s:S, deck } }); }catch(e){ console.warn("saveCloud failed", e); }
     },
     async submitScore(floor){
-      if(this.mode!=='online' || !this.sb) return;
+      if(this.mode!=='online' || !this.sb || !this._cloudLoaded) return;
       if(floor<=this._lastScore) return; this._lastScore = floor;
       try{ await this.sb.rpc('submit_score', { p_floor:floor }); }catch(e){ console.warn("submitScore failed", e); }
     },
