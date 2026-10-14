@@ -3055,7 +3055,8 @@ function bootGame(){
   const CONFIGURED = SUPA_URL.indexOf("YOUR_PROJECT_REF")===-1 && SUPA_ANON.indexOf("YOUR_SUPABASE_ANON_KEY")===-1;
 
   const Online = {
-    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _cloudLoaded:false,
+    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _cloudLoaded:false, _dirty:0, _saved:0, _dirtySince:0, _saving:false,
+    _retryAt:0, _retryDelay:4000, _status:'Saved', _scoreTarget:0, _scoreTimer:null, _scoring:false,
 
     async init(){
       injectUI();
@@ -3118,7 +3119,9 @@ function bootGame(){
       }catch(e){ console.warn("ensure_profile failed", e); }
       if(!await this.loadCloud()) return;
       this.mode='online';
+      this.setStatus(this._cloudLoaded?'Saved':'Offline – will retry');
       showGate(false); renderAcctBar(); bootGame();
+      if(!this._cloudLoaded) this.saveCloudDebounced();
     },
 
     async loadCloud(){
@@ -3142,28 +3145,86 @@ function bootGame(){
       }
     },
 
-    saveCloudDebounced(){ clearTimeout(this._saveTimer); this._saveTimer = setTimeout(()=>this.saveCloud(), 4000); },
+    setStatus(status){
+      if(status==='Saved' && this._scoreFailed) status='Offline – will retry';
+      else if(status==='Saved' && this._scoreTarget>this._lastScore) status='Saving…';
+      this._status = status;
+      const el=document.getElementById('cloudStatus'); if(el) el.textContent=status;
+    },
+    saveCloudDebounced(){
+      this._dirty++;
+      if(!this._dirtySince) this._dirtySince=Date.now();
+      if(!this._retryAt) this.setStatus('Saving…');
+      this.scheduleSave();
+    },
+    scheduleSave(){
+      clearTimeout(this._saveTimer);
+      const now=Date.now();
+      const due=this._retryAt || Math.min(now+4000, this._dirtySince+15000);
+      this._saveTimer=setTimeout(()=>this.saveCloud(), Math.max(0,due-now));
+    },
     async saveCloud(){
-      if(this.mode!=='online' || !this.sb || !this._cloudLoaded) return;
-      try{ await this.sb.rpc('save_game', { p_data:{ s:S, deck } }); }catch(e){ console.warn("saveCloud failed", e); }
+      if(this.mode!=='online' || !this.sb || this._saving || this._reloading) return;
+      clearTimeout(this._saveTimer);
+      if(this._retryAt>Date.now()){ this.scheduleSave(); return; }
+      if(this._needsReload) return this.reloadModerated(this._bootGen);
+      if(this._cloudLoaded && this._saved===this._dirty) return;
+      this._saving=true;
+      const revision=this._dirty;
+      this.setStatus('Saving…');
+      try{
+        if(!this._cloudLoaded){
+          // Never upload a cached/fresh state until a read has actually succeeded.
+          await this.loadCloud();
+          if(!this._cloudLoaded) throw new Error('Cloud unavailable');
+          resetBag(); backToHub();
+        }
+        const { error } = await withTimeout(this.sb.rpc('save_game', { p_data:{ s:S, deck } }), 10000, 'save_game');
+        if(error) throw error;
+        this._saved=revision; this._retryAt=0; this._retryDelay=4000;
+        this._dirtySince=this._dirty===revision?0:Date.now();
+        this.setStatus(this._dirty===revision?'Saved':'Saving…');
+      }catch(e){
+        console.warn('saveCloud failed', e);
+        this.setStatus('Offline – will retry');
+        this._retryAt=Date.now()+this._retryDelay;
+        this._retryDelay=Math.min(60000,this._retryDelay*2);
+      }finally{
+        this._saving=false;
+        if(this._retryAt || this._saved!==this._dirty) this.scheduleSave();
+      }
     },
     async submitScore(floor){
-      if(this.mode!=='online' || !this.sb || !this._cloudLoaded) return;
-      if(floor<=this._lastScore) return; this._lastScore = floor;
-      try{ await this.sb.rpc('submit_score', { p_floor:floor }); }catch(e){ console.warn("submitScore failed", e); }
+      if(this.mode!=='online' || !this.sb || !this._cloudLoaded || this._reloading) return;
+      if(Number.isInteger(floor)) this._scoreTarget=Math.max(this._scoreTarget,Math.min(500,floor));
+      if(this._scoreTarget<=this._lastScore || this._scoring || this._scoreTimer) return;
+      this._scoring=true;
+      const target=this._scoreTarget;
+      let delay=5000;
+      try{
+        const { error } = await withTimeout(this.sb.rpc('submit_score', { p_floor:target }), 10000, 'submit_score');
+        if(error) throw error;
+        this._lastScore=target; this._scoreFailed=false;
+        if(this._saved===this._dirty && !this._retryAt) this.setStatus('Saved');
+      }catch(e){ console.warn('submitScore failed', e); delay=15000; this.setStatus('Offline ? will retry'); }
+      finally{
+        this._scoring=false;
+        if(this._scoreTarget>this._lastScore) this._scoreTimer=setTimeout(()=>{ this._scoreTimer=null; this.submitScore(this._scoreTarget); },delay);
+      }
     },
     async signOut(){ try{ if(this.sb) await this.sb.auth.signOut(); }catch(e){} location.reload(); },
 
     async fetchLeaderboard(){
-      const { data } = await this.sb.from('profiles').select('username,best_floor').eq('banned',false).order('best_floor',{ascending:false}).limit(50);
+      const { data, error } = await this.sb.from('profiles').select('username,best_floor').eq('banned',false).order('best_floor',{ascending:false}).limit(50);
+      if(error) throw error;
       return data || [];
     },
     isAdmin(){ return !!(this.profile && this.profile.is_admin); },
     isBanned(){ return !!(this.profile && this.profile.banned); },
 
     // ---- admin ----
-    async adminList(){ const { data } = await this.sb.from('profiles').select('id,username,best_floor,banned,last_active').order('best_floor',{ascending:false}); return data||[]; },
-    async adminBan(id,val){ await this.sb.from('profiles').update({banned:val}).eq('id',id); },
+    async adminList(){ const { data, error } = await this.sb.from('profiles').select('id,username,best_floor,banned,last_active').order('best_floor',{ascending:false}); if(error) throw error; return data||[]; },
+    async adminBan(id,val){ const {error}=await this.sb.from('profiles').update({banned:val}).eq('id',id); if(error) throw error; },
     async adminResetPlayer(id){ await this.sb.from('saves').delete().eq('user_id',id); await this.sb.from('profiles').update({best_floor:0}).eq('id',id); },
     async adminWipeItems(id){
       const { data } = await this.sb.from('saves').select('data').eq('user_id',id).maybeSingle();
@@ -3176,6 +3237,10 @@ function bootGame(){
     },
   };
   window.Online = Online;
+  function flushCloud(){ Online.saveCloud(); Online.submitScore(Online._scoreTarget); }
+  document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='hidden') flushCloud(); });
+  window.addEventListener('pagehide', flushCloud);
+  window.addEventListener('online', ()=>{ Online._retryAt=0; flushCloud(); });
 
   // ---------- UI injection ----------
   function injectUI(){
@@ -3238,9 +3303,10 @@ function bootGame(){
   window.renderAcctBar = function(){
     const bar = document.getElementById('acctBar'); if(!bar) return;
     bar.style.display='flex';
-    if(Online.mode==='online' && Online.profile){
+    if(Online.mode==='online'){
       const banned = Online.isBanned() ? ' <span style="color:var(--red)">(banned)</span>' : '';
-      bar.innerHTML = '<span class="ab-user">👤 '+esc(Online.profile.username)+banned+'</span>'
+      bar.innerHTML = '<span class="ab-user">👤 '+esc(Online.profile?Online.profile.username:'Cached account')+banned+'</span>'
+        + '<small id="cloudStatus" class="hint" aria-live="polite">'+esc(Online._status)+'</small>'
         + '<button class="btn ghost sm" onclick="Online.signOut()">Sign out</button>';
     } else {
       bar.innerHTML = '<span class="ab-user">👻 Playing offline</span>'
