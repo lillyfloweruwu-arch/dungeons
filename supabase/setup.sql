@@ -31,33 +31,6 @@ language sql stable security definer set search_path = public as $$
   select coalesce((select is_admin from public.profiles where id = auth.uid()), false);
 $$;
 
--- profiles: anyone may read (leaderboard); only admins may update/delete directly.
-drop policy if exists profiles_select on public.profiles;
-create policy profiles_select on public.profiles for select using ( true );
-
-drop policy if exists profiles_admin_update on public.profiles;
-create policy profiles_admin_update on public.profiles for update
-  using ( public.is_admin() ) with check ( public.is_admin() );
-
-drop policy if exists profiles_admin_delete on public.profiles;
-create policy profiles_admin_delete on public.profiles for delete
-  using ( public.is_admin() );
-
--- saves: a user reads only their own row (admins read any); writes go through save_game().
-drop policy if exists saves_select on public.saves;
-create policy saves_select on public.saves for select
-  using ( auth.uid() = user_id or public.is_admin() );
-
-drop policy if exists saves_admin_update on public.saves;
-create policy saves_admin_update on public.saves for update
-  using ( public.is_admin() ) with check ( public.is_admin() );
-
-drop policy if exists saves_admin_delete on public.saves;
-create policy saves_admin_delete on public.saves for delete
-  using ( public.is_admin() );
-
--- 3. FUNCTIONS (all security-definer: they are the only write path for users) ---
-
 -- Create/fetch the caller's profile, giving a unique username from their first name.
 create or replace function public.ensure_profile(p_first_name text)
 returns public.profiles
@@ -88,56 +61,88 @@ begin
   return prof;
 end; $$;
 
--- Save the caller's game blob (rejects banned users; throttled to 1 write / 3s).
+
+-- Idempotent hardening for existing installations. Apply before deploying the client.
+begin;
+alter table public.profiles add column if not exists last_score_at timestamptz;
+
+-- Only self/admin can inspect profile metadata; rankings expose two fields via RPC.
+drop policy if exists profiles_select on public.profiles;
+create policy profiles_select on public.profiles for select to authenticated
+  using (auth.uid() = id or public.is_admin());
+drop policy if exists saves_select on public.saves;
+create policy saves_select on public.saves for select to authenticated
+  using (auth.uid() = user_id or public.is_admin());
+revoke select on public.profiles, public.saves from public, anon;
+grant select on public.profiles, public.saves to authenticated;
+
+create or replace function public.get_leaderboard(p_limit int)
+returns table(username text, best_floor int)
+language sql stable security definer set search_path = public, pg_temp as $$
+  select p.username, p.best_floor from public.profiles p
+  where not p.banned order by p.best_floor desc, p.username
+  limit greatest(1, least(coalesce(p_limit, 50), 100));
+$$;
+
+-- Lock the profile first, then the save (also serializes insertion of absent saves).
+-- Throttle errors are explicit so clients retry instead of claiming a lost write saved.
 create or replace function public.save_game(p_data jsonb)
 returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  uid  uuid := auth.uid();
-  last timestamptz;
-  is_banned boolean;
-begin
-  if uid is null then raise exception 'not authenticated'; end if;
-  select banned into is_banned from public.profiles where id = uid;
-  if coalesce(is_banned, false) then raise exception 'account banned'; end if;
-
-  select updated_at into last from public.saves where user_id = uid;
-  if last is not null and now() - last < interval '3 seconds' then
-    return;  -- throttle: silently ignore too-frequent writes
-  end if;
-
-  insert into public.saves (user_id, data, updated_at) values (uid, p_data, now())
-    on conflict (user_id) do update set data = excluded.data, updated_at = now();
-  update public.profiles set last_active = now() where id = uid;
-end; $$;
-
--- Submit a deepest-floor score (validated 1..500, monotonic, banned blocked).
-create or replace function public.submit_score(p_floor int)
-returns void
-language plpgsql security definer set search_path = public as $$
+language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   uid uuid := auth.uid();
-  is_banned boolean;
+  prof public.profiles;
+  saved public.saves;
 begin
   if uid is null then raise exception 'not authenticated'; end if;
-  if p_floor is null or p_floor < 1 or p_floor > 500 then return; end if;
-  select banned into is_banned from public.profiles where id = uid;
-  if coalesce(is_banned, false) then return; end if;
-
-  update public.profiles
-     set best_floor = greatest(best_floor, p_floor), last_active = now()
-   where id = uid;
+  if jsonb_typeof(p_data) is distinct from 'object'
+     or jsonb_typeof(p_data->'s') is distinct from 'object' then
+    raise exception 'invalid save object';
+  end if;
+  if octet_length(p_data::text) > 204800 then raise exception 'save too large'; end if;
+  select * into prof from public.profiles where id = uid for update;
+  if not found then raise exception 'profile missing'; end if;
+  if prof.banned then raise exception 'account banned'; end if;
+  select * into saved from public.saves where user_id = uid for update;
+  if found and clock_timestamp() - saved.updated_at < interval '3 seconds' then
+    raise exception 'save cooldown';
+  end if;
+  insert into public.saves(user_id, data, updated_at) values(uid, p_data, clock_timestamp())
+    on conflict(user_id) do update set data = excluded.data, updated_at = excluded.updated_at;
+  update public.profiles set last_active = clock_timestamp() where id = uid;
 end; $$;
 
--- 4. GRANTS ---------------------------------------------------
-grant execute on function public.is_admin()            to authenticated;
-grant execute on function public.ensure_profile(text)  to authenticated;
-grant execute on function public.save_game(jsonb)      to authenticated;
-grant execute on function public.submit_score(int)     to authenticated;
+-- No bootstrap bypass: even a player with no server best advances one step at a time.
+-- The client queues a local/cloud best ahead of the server and catches up every 5s.
+-- Existing scores are preserved. The game records the next unlocked floor, starting at 1.
+-- This limits submissions; it cannot prove gameplay in a fully client-side offline game.
+create or replace function public.submit_score(p_floor int)
+returns void
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  uid uuid := auth.uid();
+  prof public.profiles;
+begin
+  if uid is null then raise exception 'not authenticated'; end if;
+  if p_floor is null or p_floor < 1 or p_floor > 500 then raise exception 'invalid floor'; end if;
+  select * into prof from public.profiles where id = uid for update;
+  if not found then raise exception 'profile missing'; end if;
+  if prof.banned then raise exception 'account banned'; end if;
+  if p_floor <= prof.best_floor then return; end if; -- idempotent retry after a lost response
+  if p_floor > prof.best_floor + 1 then raise exception 'score progression limit'; end if;
+  if clock_timestamp() - prof.last_score_at < interval '5 seconds' then raise exception 'score cooldown'; end if;
+  update public.profiles set best_floor = p_floor, last_score_at = clock_timestamp(),
+    last_active = clock_timestamp() where id = uid;
+end; $$;
 
--- ============================================================
---  After running this, make yourself an admin (replace the email):
---    update public.profiles set is_admin = true
---    where id = (select id from auth.users where email = 'YOUR_GOOGLE_EMAIL');
---  (Run that AFTER you've signed in once so your row exists.)
--- ============================================================
+revoke execute on function public.is_admin() from public, anon;
+revoke execute on function public.ensure_profile(text) from public, anon;
+revoke execute on function public.save_game(jsonb) from public, anon;
+revoke execute on function public.submit_score(int) from public, anon;
+revoke execute on function public.get_leaderboard(int) from public, anon;
+grant execute on function public.is_admin() to authenticated;
+grant execute on function public.ensure_profile(text) to authenticated;
+grant execute on function public.save_game(jsonb) to authenticated;
+grant execute on function public.submit_score(int) to authenticated;
+grant execute on function public.get_leaderboard(int) to authenticated;
+commit;

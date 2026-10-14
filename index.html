@@ -3126,12 +3126,14 @@ function bootGame(){
         if(gen!==this._bootGen) return;
         if(error) throw error;
         this.profile = Array.isArray(data) ? data[0] : data;
+        this._lastScore=this.profile.best_floor || 0;
       }catch(e){ if(gen!==this._bootGen) return; console.warn("ensure_profile failed", e); }
       if(gen!==this._bootGen || !await this.loadCloud(gen) || gen!==this._bootGen) return;
       this.mode='online';
       this.setStatus(this._cloudLoaded?'Saved':'Offline – will retry');
       showGate(false); renderAcctBar(); bootGame();
       if(!this._cloudLoaded) this.saveCloudDebounced();
+      else this.submitScore(S.bestFloor);
     },
 
     async loadCloud(gen=this._bootGen, fallback=true){
@@ -3218,7 +3220,7 @@ function bootGame(){
       if(this._scoreTarget<=this._lastScore || this._scoring || this._scoreTimer) return;
       this._scoring=true;
       const gen=this._bootGen;
-      const target=this._scoreTarget;
+      const target=Math.min(this._scoreTarget,this._lastScore+1);
       let delay=5000;
       try{
         const { error } = await withTimeout(this.sb.rpc('submit_score', { p_floor:target }), 10000, 'submit_score');
@@ -3236,7 +3238,7 @@ function bootGame(){
     async signOut(){ try{ if(this.sb) await this.sb.auth.signOut(); }catch(e){} location.reload(); },
 
     async fetchLeaderboard(){
-      const { data, error } = await this.sb.from('profiles').select('username,best_floor').eq('banned',false).order('best_floor',{ascending:false}).limit(50);
+      const { data, error } = await this.sb.rpc('get_leaderboard', { p_limit:50 });
       if(error) throw error;
       return data || [];
     },
