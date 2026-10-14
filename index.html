@@ -729,13 +729,13 @@ function syncActiveDeck(){ const d=activeDeck(); deck = d ? d.cards : DEFAULT_DE
 // Normalize S.decks into a valid library and pick a valid active deck.
 function ensureDeckLibrary(legacyDeck){
   if(!Array.isArray(S.decks) || !S.decks.length){
-    const legacy = (legacyDeck && legacyDeck.length) ? legacyDeck.filter(validQ)
-                 : (Array.isArray(S.deck) && S.deck.length ? S.deck.filter(validQ) : DEFAULT_DECK.slice());
+    const legacy = (Array.isArray(legacyDeck) && legacyDeck.length) ? cleanCards(legacyDeck)
+                 : (Array.isArray(S.deck) && S.deck.length ? cleanCards(S.deck) : DEFAULT_DECK.slice());
     S.decks = [{ id:newDeckId(), name:"My Deck", cards: legacy.length?legacy:DEFAULT_DECK.slice() }];
   }
   S.decks = S.decks
     .filter(d=>d && Array.isArray(d.cards))
-    .map(d=>({ id:typeof d.id==='string' && /^[a-zA-Z0-9_-]+$/.test(d.id)?d.id:newDeckId(), name:String(d.name||"Deck").slice(0,60), cards:d.cards.filter(validQ) }))
+    .map(d=>({ id:typeof d.id==='string' && /^[a-zA-Z0-9_-]+$/.test(d.id)?d.id:newDeckId(), name:String(d.name||"Deck").slice(0,60), cards:cleanCards(d.cards) }))
     .filter(d=>d.cards.length);
   if(!S.decks.length) S.decks = [{ id:newDeckId(), name:"Default Deck", cards:DEFAULT_DECK.slice() }];
   if(!S.activeDeckId || !S.decks.some(d=>d.id===S.activeDeckId)) S.activeDeckId = S.decks[0].id;
@@ -784,24 +784,26 @@ function parseQuizlet(text, tdSepKey, cardSepKey){
   const TD = ({tab:'\t', dash:' - ', comma:','})[tdSepKey] || '\t';
   const cardSep = ({nl:null, semi:';'})[cardSepKey]; // null => split on newlines
   const rows = (cardSep ? text.split(cardSep) : text.split(/\r?\n/)).map(r=>r.trim()).filter(Boolean);
-  const pairs = [];
+  const pairs = [], reasons = [];
   for(const r of rows){
     const idx = r.indexOf(TD);
-    if(idx<0) continue;
+    if(idx<0){ reasons.push('missing term/definition separator'); continue; }
     const term = r.slice(0, idx).trim();
     const def  = r.slice(idx + TD.length).trim();
     if(term && def) pairs.push({ term, def });
+    else reasons.push('empty term or definition');
   }
   const defs = pairs.map(p=>p.def);
   const cards = [];
   for(const p of pairs){
     const pool = shuffleArr([...new Set(defs.filter(d=>d!==p.def))]).slice(0,3);
-    if(pool.length<3) continue;                 // need 3 distinct wrong answers
+    if(pool.length<3){ reasons.push('needs four distinct definitions'); continue; }                 // need 3 distinct wrong answers
     const opts = shuffleArr([p.def, ...pool]);
     const card = { q:p.term, o:opts, a:opts.indexOf(p.def) };
-    if(validQ(card)) cards.push(card);
+    const result=validateCard(card);
+    if(result.ok) cards.push(result.card); else reasons.push(result.reason);
   }
-  return { cards, pairs, enough: pairs.length>=4 };
+  return { cards, pairs, enough: pairs.length>=4, skipped:reasons.length, reasons };
 }
 
 /* ==========================================================================
@@ -1471,23 +1473,21 @@ function recordAnswer(q, correct){
    - Scramble mode: keep the correct answer, swap the 3 wrong ones for random
      answers pulled from OTHER questions each time (prevents memorizing patterns). */
 function buildOptions(q){
-  const correct = q.o[q.a];
-  let opts;
-  if(S.settings && S.settings.scrambleAnswers && deck.length>=4){
-    const seen = new Set([correct]);
-    const pool = [];
-    deck.forEach(d=> d.o.forEach(o=>{ if(o && !seen.has(o)){ seen.add(o); pool.push(o); } }));
-    for(let i=pool.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [pool[i],pool[j]]=[pool[j],pool[i]]; }
-    const distractors = pool.slice(0,3);
-    // fall back to the question's own wrong options if the pool is too small
-    if(distractors.length<3) q.o.forEach((o,idx)=>{ if(idx!==q.a && distractors.length<3 && !distractors.includes(o)) distractors.push(o); });
-    opts = [correct, ...distractors];
-  } else {
-    opts = q.o.slice();
+  const correct = String(q.o[q.a]).trim();
+  const seen = new Set([correct.toLowerCase()]);
+  const pool = [];
+  function add(o){
+    if(typeof o!=='string') return;
+    const text=o.trim(), key=text.toLowerCase();
+    if(text && !seen.has(key)){ seen.add(key); pool.push(text); }
   }
-  const arr = opts.map(t=>({text:t, correct: t===correct}));
-  for(let i=arr.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; }
-  return arr;
+  if(S.settings && S.settings.scrambleAnswers && deck.length>=4){
+    deck.forEach(d=>d.o.forEach(add));
+    shuffleArr(pool);
+  }
+  q.o.forEach(add);
+  // Even a legacy/malformed card can yield only one correct button.
+  return shuffleArr([{text:correct,correct:true}, ...pool.slice(0,3).map(text=>({text,correct:false}))]);
 }
 
 function openQuestion(a){
@@ -2276,7 +2276,68 @@ function setImportMode(mode){
     : 'Paste JSON like:  [{"q":"...","o":["A","B","C","D"],"a":0}, ...]   — or a DS- code';
 }
 
-function validQ(x){ return x && typeof x.q==="string" && Array.isArray(x.o) && x.o.length===4 && Number.isInteger(x.a) && x.a>=0 && x.a<4; }
+function validateCard(x) {
+  // 1. x must be a non-null object (not an array)
+  if (x === null || typeof x !== 'object' || Array.isArray(x)) {
+    return { ok: false, reason: 'not an object' };
+  }
+
+  // 2. x.q must be a string, non-empty after trim, at most 300 chars after trim
+  if (typeof x.q !== 'string') {
+    return { ok: false, reason: 'missing question' };
+  }
+  var q = x.q.trim();
+  if (q.length === 0) {
+    return { ok: false, reason: 'missing question' };
+  }
+  if (q.length > 300) {
+    return { ok: false, reason: 'question too long' };
+  }
+
+  // 3. x.o must be an array of exactly 4 items
+  if (!Array.isArray(x.o) || x.o.length !== 4) {
+    return { ok: false, reason: 'needs exactly 4 options' };
+  }
+
+  // 4. Every option must be a string, non-empty after trim, at most 200 chars after trim
+  var options = [];
+  for (var i = 0; i < 4; i++) {
+    var opt = x.o[i];
+    if (typeof opt !== 'string') {
+      return { ok: false, reason: 'option ' + (i + 1) + ' is empty or not text' };
+    }
+    var trimmed = opt.trim();
+    if (trimmed.length === 0) {
+      return { ok: false, reason: 'option ' + (i + 1) + ' is empty or not text' };
+    }
+    if (trimmed.length > 200) {
+      return { ok: false, reason: 'option ' + (i + 1) + ' is too long' };
+    }
+    options.push(trimmed);
+  }
+
+  // 5. The 4 trimmed options must be distinct, comparing case-insensitively
+  var lower = options.map(function(o) { return o.toLowerCase(); });
+  for (var j = 0; j < 4; j++) {
+    for (var k = j + 1; k < 4; k++) {
+      if (lower[j] === lower[k]) {
+        return { ok: false, reason: 'duplicate options' };
+      }
+    }
+  }
+
+  // 6. x.a must be an integer 0..3
+  if (typeof x.a !== 'number' || !Number.isInteger(x.a) || x.a < 0 || x.a > 3) {
+    return { ok: false, reason: 'answer index must be 0-3' };
+  }
+
+  return { ok: true, card: { q: q, o: options, a: x.a } };
+}
+function cleanCards(cards){ return cards.map(validateCard).filter(r=>r.ok).map(r=>r.card); }
+function cardRejections(res){
+  return res.skipped ? `${res.skipped} card(s) rejected: ${res.reasons.slice(0,3).join('; ')}${res.skipped>3?'; ...':''}` : '';
+}
+
 
 /* Parse raw JSON OR a DS- Base64 code into clean cards. Returns {cards, skipped, recovered}. */
 function parseJsonOrDs(raw, msgEl){
@@ -2295,8 +2356,10 @@ function parseJsonOrDs(raw, msgEl){
     matches.forEach(m=>{ try{ const o=JSON.parse(m); arr.push(o); }catch(e){} });
     recovered = true;
   }
-  const cards = arr.filter(validQ);
-  return { cards, skipped: arr.length - cards.length, recovered };
+  const results=arr.map(validateCard);
+  const cards=results.filter(r=>r.ok).map(r=>r.card);
+  const reasons=results.filter(r=>!r.ok).map(r=>r.reason);
+  return { cards, skipped:reasons.length, reasons, recovered };
 }
 
 /* Build a brand-new deck from the pasted content and switch to it. */
@@ -2311,16 +2374,15 @@ function doImport(){
     const tdSep = document.getElementById('qzTermSep').value;
     const cardSep = document.getElementById('qzCardSep').value;
     const res = parseQuizlet(raw, tdSep, cardSep);
-    if(!res.enough){ msgEl.innerHTML="<span style='color:var(--red)'>Need at least <b>4 cards</b> to build multiple-choice questions. Found "+res.pairs.length+".</span>"; return; }
-    if(res.cards.length===0){ msgEl.innerHTML="<span style='color:var(--red)'>Couldn't read any term/definition pairs. Check the separators above match your paste (Quizlet's default is a Tab).</span>"; return; }
+    if(!res.enough || !res.cards.length){ msgEl.textContent='Need at least 4 valid cards with distinct definitions. '+cardRejections(res); return; }
     cards = res.cards;
-    if(res.cards.length < res.pairs.length) note = `<br><span style="color:var(--gold)">${res.pairs.length-res.cards.length} card(s) skipped (needed more unique definitions for wrong answers).</span>`;
+    if(res.skipped) note = `<br><span style="color:var(--gold)">${esc(cardRejections(res))}</span>`;
   } else {
     const res = parseJsonOrDs(raw, msgEl);
     if(!res) return; // msg already set
-    if(res.cards.length===0){ msgEl.innerHTML="<span style='color:var(--red)'>No valid questions found. Each needs <b>q</b>, exactly 4 <b>o</b> options, and an <b>a</b> index 0–3.</span>"; return; }
+    if(!res.cards.length){ msgEl.textContent='No valid questions found. '+cardRejections(res); return; }
     cards = res.cards;
-    if(res.recovered || res.skipped>0) note = `<br><span style="color:var(--gold)">Note: ${res.skipped>0?res.skipped+" malformed entr"+(res.skipped!==1?"ies":"y")+" skipped. ":""}For best results use raw JSON, not a DS- code.</span>`;
+    if(res.recovered || res.skipped) note = `<br><span style="color:var(--gold)">${esc(cardRejections(res))}${res.recovered?' Recovered partial JSON; check your source.':''}</span>`;
   }
 
   const d = addDeck(name || defaultDeckName(), cards);
