@@ -3044,10 +3044,11 @@ function bootGame(){
   // Race a promise against a timer so a blocked/black-holed network request
   // (e.g. a school filter silently dropping Supabase traffic) can never freeze boot.
   function withTimeout(promise, ms, label){
+    let timer;
     return Promise.race([
       Promise.resolve(promise),
-      new Promise((_,rej)=> setTimeout(()=> rej(new Error((label||'request')+' timed out')), ms))
-    ]);
+      new Promise((_,rej)=>{ timer=setTimeout(()=>rej(new Error((label||'request')+' timed out')),ms); })
+    ]).finally(()=>clearTimeout(timer));
   }
   // ---- CONFIG: paste your Supabase project values here (both are safe to be public) ----
   const SUPA_URL  = "https://ldrdlmhvaswrlxrajxgp.supabase.co";
@@ -3055,10 +3056,11 @@ function bootGame(){
   const CONFIGURED = SUPA_URL.indexOf("YOUR_PROJECT_REF")===-1 && SUPA_ANON.indexOf("YOUR_SUPABASE_ANON_KEY")===-1;
 
   const Online = {
-    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _cloudLoaded:false, _dirty:0, _saved:0, _dirtySince:0, _saving:false,
+    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _bootGen:0, _cloudLoaded:false, _dirty:0, _saved:0, _dirtySince:0, _saving:false,
     _retryAt:0, _retryDelay:4000, _status:'Saved', _scoreTarget:0, _scoreTimer:null, _scoring:false,
 
     async init(){
+      const gen=++this._bootGen;
       injectUI();
       // Show the gate IMMEDIATELY — before any network call — so the app is always
       // usable even when a school content filter blocks Supabase, Google, or the CDN.
@@ -3077,12 +3079,16 @@ function bootGame(){
       // network freeze the page: each step is capped by a timeout.
       try{
         const res = await withTimeout(this.sb.auth.getSession(), 6000, 'getSession');
+        if(gen!==this._bootGen) return;
+        if(res.error) throw res.error;
         const session = res && res.data && res.data.session;
         if(session){
           setGateNote("Restoring your session…");
-          await withTimeout(this.enterOnline(session), 12000, 'enterOnline');
+          await withTimeout(this.enterOnline(session, gen), 12000, 'enterOnline');
         }
       }catch(e){
+        if(gen!==this._bootGen) return;
+        ++this._bootGen; this._cloudLoaded=false;
         console.warn("Session restore skipped:", e && e.message);
         this.mode = null;
         setGateNote("Couldn't reach the server — Play Offline works, or try Sign in.");
@@ -3101,12 +3107,15 @@ function bootGame(){
     },
 
     playOffline(){
+      ++this._bootGen; clearTimeout(this._saveTimer); clearTimeout(this._scoreTimer);
+      this.profile=null; this.session=null;
       this.mode = 'offline'; this._cloudLoaded = false;
       SAVE_KEY = GUEST_SAVE_KEY; migrateGuestSave(); load();
       showGate(false); renderAcctBar(); bootGame();
     },
 
-    async enterOnline(session){
+    async enterOnline(session, gen=this._bootGen){
+      if(gen!==this._bootGen) return;
       this.session = session; this.mode = 'loading'; this._cloudLoaded = false;
       SAVE_KEY = 'dungeon_legends_save_user_' + session.user.id;
       const meta = session.user.user_metadata || {};
@@ -3114,20 +3123,23 @@ function bootGame(){
       const first = String(full).trim().split(/\s+/)[0] || "Player";
       try{
         const { data, error } = await this.sb.rpc('ensure_profile', { p_first_name:first });
+        if(gen!==this._bootGen) return;
         if(error) throw error;
         this.profile = Array.isArray(data) ? data[0] : data;
-      }catch(e){ console.warn("ensure_profile failed", e); }
-      if(!await this.loadCloud()) return;
+      }catch(e){ if(gen!==this._bootGen) return; console.warn("ensure_profile failed", e); }
+      if(gen!==this._bootGen || !await this.loadCloud(gen) || gen!==this._bootGen) return;
       this.mode='online';
       this.setStatus(this._cloudLoaded?'Saved':'Offline – will retry');
       showGate(false); renderAcctBar(); bootGame();
       if(!this._cloudLoaded) this.saveCloudDebounced();
     },
 
-    async loadCloud(){
+    async loadCloud(gen=this._bootGen, fallback=true){
+      if(gen!==this._bootGen) return false;
       this._cloudLoaded = false;
       try{
         const { data, error } = await withTimeout(this.sb.from('saves').select('data').eq('user_id', this.session.user.id).maybeSingle(), 8000, 'loadCloud');
+        if(gen!==this._bootGen) return false;
         if(error) throw error;
         // An absent row (or the empty placeholder created by ensure_profile) is confirmed fresh.
         if(data && data.data && data.data.s && typeof data.data.s==='object' && !Array.isArray(data.data.s)){ hydrateSave(data.data); }
@@ -3137,6 +3149,7 @@ function bootGame(){
         try{ localStorage.setItem(SAVE_KEY, JSON.stringify({s:S, deck})); }catch(e){}
         return true;
       }catch(e){
+        if(gen!==this._bootGen) return false;
         console.warn("loadCloud failed", e);
         const cached = fallback ? cachedSave(SAVE_KEY) : null;
         if(cached){ hydrateSave(cached); toast("Cloud unavailable — playing your cached save. Cloud writes are paused."); return true; }
@@ -3170,26 +3183,31 @@ function bootGame(){
       if(this._needsReload) return this.reloadModerated(this._bootGen);
       if(this._cloudLoaded && this._saved===this._dirty) return;
       this._saving=true;
+      const gen=this._bootGen;
       const revision=this._dirty;
       this.setStatus('Saving…');
       try{
         if(!this._cloudLoaded){
           // Never upload a cached/fresh state until a read has actually succeeded.
-          await this.loadCloud();
+          await this.loadCloud(gen);
+          if(gen!==this._bootGen) return;
           if(!this._cloudLoaded) throw new Error('Cloud unavailable');
           resetBag(); backToHub();
         }
         const { error } = await withTimeout(this.sb.rpc('save_game', { p_data:{ s:S, deck } }), 10000, 'save_game');
+        if(gen!==this._bootGen) return;
         if(error) throw error;
         this._saved=revision; this._retryAt=0; this._retryDelay=4000;
         this._dirtySince=this._dirty===revision?0:Date.now();
         this.setStatus(this._dirty===revision?'Saved':'Saving…');
       }catch(e){
+        if(gen!==this._bootGen) return;
         console.warn('saveCloud failed', e);
         this.setStatus('Offline – will retry');
         this._retryAt=Date.now()+this._retryDelay;
         this._retryDelay=Math.min(60000,this._retryDelay*2);
       }finally{
+        if(gen!==this._bootGen) return;
         this._saving=false;
         if(this._retryAt || this._saved!==this._dirty) this.scheduleSave();
       }
@@ -3199,15 +3217,18 @@ function bootGame(){
       if(Number.isInteger(floor)) this._scoreTarget=Math.max(this._scoreTarget,Math.min(500,floor));
       if(this._scoreTarget<=this._lastScore || this._scoring || this._scoreTimer) return;
       this._scoring=true;
+      const gen=this._bootGen;
       const target=this._scoreTarget;
       let delay=5000;
       try{
         const { error } = await withTimeout(this.sb.rpc('submit_score', { p_floor:target }), 10000, 'submit_score');
+        if(gen!==this._bootGen) return;
         if(error) throw error;
         this._lastScore=target; this._scoreFailed=false;
         if(this._saved===this._dirty && !this._retryAt) this.setStatus('Saved');
-      }catch(e){ console.warn('submitScore failed', e); delay=15000; this.setStatus('Offline ? will retry'); }
+      }catch(e){ if(gen!==this._bootGen) return; console.warn('submitScore failed', e); delay=15000; this.setStatus('Offline ? will retry'); }
       finally{
+        if(gen!==this._bootGen) return;
         this._scoring=false;
         if(this._scoreTarget>this._lastScore) this._scoreTimer=setTimeout(()=>{ this._scoreTimer=null; this.submitScore(this._scoreTarget); },delay);
       }
