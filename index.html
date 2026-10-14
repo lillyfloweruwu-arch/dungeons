@@ -3056,8 +3056,8 @@ function bootGame(){
   const CONFIGURED = SUPA_URL.indexOf("YOUR_PROJECT_REF")===-1 && SUPA_ANON.indexOf("YOUR_SUPABASE_ANON_KEY")===-1;
 
   const Online = {
-    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _bootGen:0, _cloudLoaded:false, _dirty:0, _saved:0, _dirtySince:0, _saving:false,
-    _retryAt:0, _retryDelay:4000, _status:'Saved', _scoreTarget:0, _scoreTimer:null, _scoring:false,
+    sb:null, session:null, profile:null, mode:null, _saveTimer:null, _lastScore:0, _saveGen:0, _needsReload:false, _reloading:null, _bootGen:0, _cloudLoaded:false, _dirty:0, _saved:0, _dirtySince:0, _saving:false,
+    _retryAt:0, _retryDelay:4000, _status:'Saved', _scoreTarget:0, _scoreTimer:null, _scoring:false, _scoreFailed:false,
 
     async init(){
       const gen=++this._bootGen;
@@ -3140,13 +3140,14 @@ function bootGame(){
       if(gen!==this._bootGen) return false;
       this._cloudLoaded = false;
       try{
-        const { data, error } = await withTimeout(this.sb.from('saves').select('data').eq('user_id', this.session.user.id).maybeSingle(), 8000, 'loadCloud');
+        const { data, error } = await withTimeout(this.sb.from('saves').select('data,save_gen').eq('user_id', this.session.user.id).maybeSingle(), 8000, 'loadCloud');
         if(gen!==this._bootGen) return false;
         if(error) throw error;
         // An absent row (or the empty placeholder created by ensure_profile) is confirmed fresh.
         if(data && data.data && data.data.s && typeof data.data.s==='object' && !Array.isArray(data.data.s)){ hydrateSave(data.data); }
         else if(!data || (data.data && Object.keys(data.data).length===0)){ S = freshState(); ensureDeckLibrary(); }
         else throw new Error('Invalid cloud save');
+        this._saveGen=data?data.save_gen:0;
         this._cloudLoaded = true;
         try{ localStorage.setItem(SAVE_KEY, JSON.stringify({s:S, deck})); }catch(e){}
         return true;
@@ -3196,7 +3197,7 @@ function bootGame(){
           if(!this._cloudLoaded) throw new Error('Cloud unavailable');
           resetBag(); backToHub();
         }
-        const { error } = await withTimeout(this.sb.rpc('save_game', { p_data:{ s:S, deck } }), 10000, 'save_game');
+        const { error } = await withTimeout(this.sb.rpc('save_game', { p_data:{ s:S, deck }, p_save_gen:this._saveGen }), 10000, 'save_game');
         if(gen!==this._bootGen) return;
         if(error) throw error;
         this._saved=revision; this._retryAt=0; this._retryDelay=4000;
@@ -3204,6 +3205,7 @@ function bootGame(){
         this.setStatus(this._dirty===revision?'Saved':'Saving…');
       }catch(e){
         if(gen!==this._bootGen) return;
+        if(String(e.message).includes('stale save generation')){ await this.reloadModerated(gen); return; }
         console.warn('saveCloud failed', e);
         this.setStatus('Offline – will retry');
         this._retryAt=Date.now()+this._retryDelay;
@@ -3223,17 +3225,55 @@ function bootGame(){
       const target=Math.min(this._scoreTarget,this._lastScore+1);
       let delay=5000;
       try{
-        const { error } = await withTimeout(this.sb.rpc('submit_score', { p_floor:target }), 10000, 'submit_score');
+        const { error } = await withTimeout(this.sb.rpc('submit_score', { p_floor:target, p_save_gen:this._saveGen }), 10000, 'submit_score');
         if(gen!==this._bootGen) return;
         if(error) throw error;
         this._lastScore=target; this._scoreFailed=false;
         if(this._saved===this._dirty && !this._retryAt) this.setStatus('Saved');
-      }catch(e){ if(gen!==this._bootGen) return; console.warn('submitScore failed', e); delay=15000; this.setStatus('Offline ? will retry'); }
+      }catch(e){
+        if(gen!==this._bootGen) return;
+        if(String(e.message).includes('stale save generation')){ await this.reloadModerated(gen); return; }
+        this._scoreFailed=true;
+        console.warn('submitScore failed', e); delay=15000; this.setStatus('Offline – will retry');
+      }
       finally{
         if(gen!==this._bootGen) return;
         this._scoring=false;
         if(this._scoreTarget>this._lastScore) this._scoreTimer=setTimeout(()=>{ this._scoreTimer=null; this.submitScore(this._scoreTarget); },delay);
       }
+    },
+    async reloadModerated(gen){
+      if(gen!==this._bootGen) return;
+      if(this._reloading) return this._reloading;
+      // Invalidate every in-flight save/score response as well as boot work.
+      gen=++this._bootGen;
+      this._cloudLoaded=false; this._needsReload=true;
+      this._saving=false; this._scoring=false;
+      this._scoreTarget=0; this._scoreFailed=false;
+      clearTimeout(this._saveTimer); clearTimeout(this._scoreTimer); this._scoreTimer=null;
+      this._reloading=(async()=>{
+        toast('Your save was updated by an admin. Reloading cloud progress.');
+        if(!await this.loadCloud(gen,false) || !this._cloudLoaded) throw new Error('Cloud reload unavailable');
+        const {data,error}=await withTimeout(this.sb.from('profiles').select('*').eq('id',this.session.user.id).single(),8000,'profile');
+        if(gen!==this._bootGen) return;
+        if(error) throw error;
+        this.profile=data; this._lastScore=data.best_floor;
+        this._saved=this._dirty; this._dirtySince=0; this._retryAt=0; this._retryDelay=4000;
+        this._needsReload=false;
+        battle=null; run=null; resetBag();
+        if(chest) clearInterval(chest.timerId);
+        document.querySelectorAll('.overlay').forEach(el=>el.classList.remove('active'));
+        backToHub(); renderAcctBar(); this.setStatus('Saved');
+      })().catch(e=>{
+        if(gen!==this._bootGen) return;
+        this._cloudLoaded=false; this.setStatus('Offline \u2013 will retry');
+        this._retryAt=Date.now()+this._retryDelay;
+        this._retryDelay=Math.min(60000,this._retryDelay*2);
+      }).finally(()=>{
+        this._reloading=null;
+        if(gen===this._bootGen && this._needsReload) this.scheduleSave();
+      });
+      return this._reloading;
     },
     async signOut(){ try{ if(this.sb) await this.sb.auth.signOut(); }catch(e){} location.reload(); },
 
@@ -3247,17 +3287,9 @@ function bootGame(){
 
     // ---- admin ----
     async adminList(){ const { data, error } = await this.sb.from('profiles').select('id,username,best_floor,banned,last_active').order('best_floor',{ascending:false}); if(error) throw error; return data||[]; },
-    async adminBan(id,val){ const {error}=await this.sb.from('profiles').update({banned:val}).eq('id',id); if(error) throw error; },
-    async adminResetPlayer(id){ await this.sb.from('saves').delete().eq('user_id',id); await this.sb.from('profiles').update({best_floor:0}).eq('id',id); },
-    async adminWipeItems(id){
-      const { data } = await this.sb.from('saves').select('data').eq('user_id',id).maybeSingle();
-      if(data && data.data && data.data.s){
-        const b = data.data;
-        b.s.inventory = [];
-        b.s.equipped = {weapon:null,armor:null,helmet:null,boots:null,accessory:null,trinket:null};
-        await this.sb.from('saves').update({data:b}).eq('user_id',id);
-      }
-    },
+    async adminBan(id,val){ const {error}=await this.sb.rpc('admin_ban_player',{uid:id,p_banned:val}); if(error) throw error; },
+    async adminResetPlayer(id){ const {error}=await this.sb.rpc('admin_reset_player',{uid:id}); if(error) throw error; },
+    async adminWipeItems(id){ const {error}=await this.sb.rpc('admin_wipe_items',{uid:id}); if(error) throw error; },
   };
   window.Online = Online;
   function flushCloud(){ Online.saveCloud(); Online.submitScore(Online._scoreTarget); }
